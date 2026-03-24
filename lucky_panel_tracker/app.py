@@ -41,6 +41,9 @@ class App:
         self.thumbnails: dict[str, ImageTk.PhotoImage] = {}  # item_id -> PhotoImage
         self.mapping: dict[tuple[int, int], str] = {}
 
+        # 最前面固定
+        self._topmost = False
+
         # Phase2制御
         self._phase2_running = False
         self._phase2_thread: Optional[threading.Thread] = None
@@ -95,6 +98,15 @@ class App:
         self.btn_reset = ttk.Button(btn_frame, text="リセット", command=self._on_reset)
         self.btn_reset.pack(side=tk.LEFT)
 
+        self.btn_topmost = ttk.Button(btn_frame, text="最前面: OFF", command=self._on_toggle_topmost)
+        self.btn_topmost.pack(side=tk.RIGHT)
+
+    # === 最前面固定 ===
+    def _on_toggle_topmost(self):
+        self._topmost = not self._topmost
+        self.root.attributes('-topmost', self._topmost)
+        self.btn_topmost.config(text=f"最前面: {'ON' if self._topmost else 'OFF'}")
+
     # === ステータス更新 ===
     def _update_status(self, text: str):
         self.status_var.set(text)
@@ -104,7 +116,12 @@ class App:
         # まず自動検出を試みる
         if self.capture.auto_detect_window():
             left, top, w, h = self.capture.region
-            self._update_status(f"ウィンドウ自動検出: {w}x{h} at ({left},{top})")
+            if self.capture.using_wgc:
+                mode = "WGC"
+            else:
+                err = getattr(self.capture, '_wgc_error', None)
+                mode = f"mss (WGC失敗: {err})" if err else "mss"
+            self._update_status(f"ウィンドウ自動検出: {w}x{h} at ({left},{top}) [{mode}]")
             self.btn_phase1.config(state=tk.NORMAL)
             self._show_preview()
             return
