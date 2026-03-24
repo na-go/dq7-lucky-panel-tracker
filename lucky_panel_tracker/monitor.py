@@ -12,7 +12,13 @@ from .grid import GridCell, GridDetector
 
 
 class ShuffleMonitor:
-    """連続フレームを受け取り、スワップイベントを検出する"""
+    """連続フレームを受け取り、スワップイベントを検出する
+
+    パフォーマンス最適化:
+    - フルフレームではなくボード領域のROIだけで差分計算
+    - グレースケール変換して比較（チャンネル数1/3）
+    - frame.copy()を最小化（ROIのみ保持）
+    """
 
     STABLE_THRESHOLD = 1.5      # 全体差分の安定判定閾値
     CELL_DIFF_MARGIN = 0.25     # セル差分計算時の端カットマージン
@@ -28,8 +34,6 @@ class ShuffleMonitor:
         self.grid = grid
         self.expected_swaps = expected_swaps
         self.state = self.State.WAITING_FLIP
-        self.stable_frame: Optional[np.ndarray] = None
-        self.prev_frame: Optional[np.ndarray] = None  # 直前フレーム（安定復帰判定用）
         self.swap_count = 0
         self.stable_count = 0
         self.swap_detected_this_event = False
@@ -37,9 +41,32 @@ class ShuffleMonitor:
         self.on_complete: Optional[Callable] = None
         self._detector = GridDetector()
 
-    def _calc_overall_diff(self, frame_a: np.ndarray, frame_b: np.ndarray) -> float:
-        """2フレーム間の全体平均差分"""
-        diff = cv2.absdiff(frame_a, frame_b)
+        # ボード領域のバウンディングボックス（ROI）を事前計算
+        self._board_roi = self._calc_board_roi()
+
+        # フレーム参照（グレースケールROIのみ保持）
+        self._stable_gray: Optional[np.ndarray] = None
+        self._prev_gray: Optional[np.ndarray] = None
+        # stable_frame はセル差分計算用にBGRで保持
+        self.stable_frame: Optional[np.ndarray] = None
+
+    def _calc_board_roi(self) -> tuple[int, int, int, int]:
+        """グリッド全体のバウンディングボックスを計算 (y1, y2, x1, x2)"""
+        min_x = min(cell.x for row in self.grid for cell in row)
+        min_y = min(cell.y for row in self.grid for cell in row)
+        max_x = max(cell.x + cell.w for row in self.grid for cell in row)
+        max_y = max(cell.y + cell.h for row in self.grid for cell in row)
+        return (min_y, max_y, min_x, max_x)
+
+    def _to_board_gray(self, frame: np.ndarray) -> np.ndarray:
+        """フレームからボード領域を切り出してグレースケール変換"""
+        y1, y2, x1, x2 = self._board_roi
+        roi = frame[y1:y2, x1:x2]
+        return cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    def _calc_overall_diff(self, gray_a: np.ndarray, gray_b: np.ndarray) -> float:
+        """2つのグレースケールROI間の平均差分"""
+        diff = cv2.absdiff(gray_a, gray_b)
         return float(np.mean(diff))
 
     def _calc_cell_diffs(self, frame: np.ndarray) -> list[tuple[float, int, int]]:
@@ -71,13 +98,16 @@ class ShuffleMonitor:
         """裏返し完了を待つ。
         直前フレームとの差分で安定判定。大きな変化を検出した後、安定に戻ったらIDLEへ。
         """
-        if self.prev_frame is None:
-            self.prev_frame = frame.copy()
+        gray = self._to_board_gray(frame)
+
+        if self._prev_gray is None:
+            self._prev_gray = gray.copy()
+            self._stable_gray = gray.copy()
             self.stable_frame = frame.copy()
             return
 
-        frame_diff = self._calc_overall_diff(frame, self.prev_frame)
-        self.prev_frame = frame.copy()
+        frame_diff = self._calc_overall_diff(gray, self._prev_gray)
+        self._prev_gray = gray  # グレーROIは小さいのでコピー不要（次フレームで上書き前に使用完了）
 
         if frame_diff >= self.STABLE_THRESHOLD:
             # 変化中（裏返しアニメーション）
@@ -89,42 +119,46 @@ class ShuffleMonitor:
                 if self.stable_count >= self.STABLE_COUNT_NEEDED:
                     # 裏返し完了 → IDLE遷移
                     self.state = self.State.IDLE
+                    self._stable_gray = gray.copy()
                     self.stable_frame = frame.copy()
                     self.stable_count = 0
 
     def _handle_idle(self, frame: np.ndarray):
         """スワップ間の安定状態"""
-        overall_diff = self._calc_overall_diff(frame, self.stable_frame)
+        gray = self._to_board_gray(frame)
+        overall_diff = self._calc_overall_diff(gray, self._stable_gray)
 
         if overall_diff >= self.STABLE_THRESHOLD:
             # スワップ開始検出
             self.state = self.State.SWAPPING
             self.swap_detected_this_event = False
-            # 最初のフレームでtop2を取る
+            self._prev_gray = gray.copy()
+            # スワップ位置を検出
             self._detect_swap(frame)
-        else:
-            # 安定継続 → 安定フレームを更新
-            self.stable_frame = frame.copy()
+        # IDLE安定時: stable_frameは毎フレーム更新しない（変化がないため不要）
 
     def _handle_swapping(self, frame: np.ndarray):
         """スワップアニメーション中
         直前フレームとの差分で安定復帰を判定する。
-        スワップ後はパネルが入れ替わるため、stable_frameとの差分は残り続ける。
         """
-        if self.prev_frame is None:
-            self.prev_frame = frame.copy()
+        gray = self._to_board_gray(frame)
+
+        if self._prev_gray is None:
+            self._prev_gray = gray.copy()
             return
 
-        frame_diff = self._calc_overall_diff(frame, self.prev_frame)
-        self.prev_frame = frame.copy()
+        frame_diff = self._calc_overall_diff(gray, self._prev_gray)
+        self._prev_gray = gray  # 次フレームで参照
 
         if frame_diff < self.STABLE_THRESHOLD:
             self.stable_count += 1
             if self.stable_count >= self.STABLE_COUNT_NEEDED:
                 # 安定に戻った → スワップ完了
                 self.state = self.State.IDLE
+                self._stable_gray = gray.copy()
                 self.stable_frame = frame.copy()
                 self.stable_count = 0
+                self._prev_gray = None
 
                 # 期待スワップ回数に達したか確認
                 if self.swap_count >= self.expected_swaps:
