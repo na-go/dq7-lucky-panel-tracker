@@ -6,3 +6,6 @@ samples/debug_frames/
 samples/test_grid_result.png
 .idea/
 .vscode/
+build/
+dist/
+nul
