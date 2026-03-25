@@ -193,6 +193,7 @@ class WgcCapture:
         self._width = 0
         self._height = 0
         self._started = False
+        self._last_frame: Optional[np.ndarray] = None
 
     def __del__(self):
         self.stop()
@@ -222,16 +223,21 @@ class WgcCapture:
         return (self._width, self._height)
 
     def grab(self) -> Optional[np.ndarray]:
-        """最新フレームをBGR numpy arrayで返す。フレームなしならNone。"""
+        """最新フレームをBGR numpy arrayで返す。
+
+        新しいフレームがなければ直前のキャッシュを返す。
+        ゲーム画面が静止している場合でも安定してフレームを返せる。
+        """
         if not self._started:
             return None
         try:
             frame = self._get_frame()
             if frame is not None:
+                self._last_frame = frame
                 return frame
         except Exception:
             pass
-        return None
+        return self._last_frame
 
     def wait_first_frame(self, timeout: float = 1.0) -> bool:
         """最初のフレームが届くまで待機。タイムアウトでFalse。"""
