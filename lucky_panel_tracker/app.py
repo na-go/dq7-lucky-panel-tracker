@@ -285,7 +285,7 @@ class App:
 
     def _phase2_loop(self):
         """Phase2のメインループ（別スレッド）"""
-        for frame in self.capture.grab_continuous(fps=30):
+        for frame in self.capture.grab_continuous(fps=60):
             if not self._phase2_running:
                 break
             self.monitor.process_frame(frame)
